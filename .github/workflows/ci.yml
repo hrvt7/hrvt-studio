@@ -1,0 +1,287 @@
+name: CI
+
+# H2 (roadmap: research/V0118-ROADMAP-RESEARCH.md §4.2) — the test gate
+# the deploy pipelines never had. Three deploy targets publish `main`
+# directly, and until now every test in this repo ran only on a
+# contributor's laptop.
+#
+#   pull_request    → fast feedback, no DB required:
+#                     npm ci → tsc --noEmit → eslint → vitest run
+#   push to main    → the same gate + the full Playwright browser suite
+#                     against a real Postgres service container, so
+#                     nothing lands on `main` untested by e2e either.
+#   workflow_dispatch → run the whole pipeline (incl. e2e) on demand,
+#                     e.g. before cutting a release or on a risky PR.
+#
+# Binding the gate: CONTRIBUTING.md → "CI & required checks" documents
+# the one-time branch-protection setup (require the `lint-unit` check).
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  # ── Fast gate: every pull request ─────────────────────────────────
+  lint-unit:
+    name: lint-unit
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+
+      # postinstall runs `prisma generate` + the wasm portability patch,
+      # so tsc has the generated client types it type-checks against.
+      - name: Install dependencies
+        run: npm ci --no-audit --no-fund
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Lint
+        run: npm run lint
+
+      # 316 unit tests — pure functions + mocked-route tests, no DB.
+      - name: Unit tests
+        run: npm test
+
+      # v0.16.1: the gate never ran `next build` — A1's edge-
+      # instrumentation regression (Prisma traced into the edge bundle
+      # via a static import) passed typecheck, lint, unit AND the
+      # dev-server e2e, and only failed on the self-hosted deployer.
+      # The production build is part of what this gate protects.
+      # No DB needed: route handlers are request-time, the landing
+      # page is static, and PrismaClient construction is lazy.
+      - name: Production build
+        run: npm run build
+
+  # ── Browser suite: merges to main + manual dispatch ───────────────
+  e2e:
+    name: e2e
+    needs: lint-unit
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    # The suite's own test time is ~15-17 min (95 specs, workers:1) on top
+    # of npm ci + browser + ffmpeg + dev-server boot. The former 20-min cap
+    # was right at the boundary and cancelled two consecutive main runs
+    # (42812723870, 42821994414) on slow runners — 35 min gives honest
+    # headroom without masking real hangs (each spec still has its own
+    # 60 s timeout + the webServer's 180 s boot budget).
+    timeout-minutes: 35
+
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: canvix
+          POSTGRES_PASSWORD: canvix
+          POSTGRES_DB: canvix
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U canvix"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+
+    env:
+      # Plain local URL — db-url.ts leaves localhost alone (no SSL).
+      # db:setup applies migrations + seeds the 366-template library;
+      # playwright.config.ts boots `npm run dev` itself.
+      DATABASE_URL: postgresql://canvix:canvix@localhost:5432/canvix
+      # The suite registers several accounts by design (one per spec
+      # module: d4 image-filters, clipboard, admin-console, uploads,
+      # wave3…). The 5/h/IP register cap exists for public hosts —
+      # on the single-localhost CI runner it only breaks later specs
+      # (first seen: wave3 at 429 after five earlier registrations).
+      # Same call scripts/verify-wave3.sh makes for the sandbox.
+      CANVIX_RATE_LIMITS: 'off'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci --no-audit --no-fund
+
+      - name: Install Playwright browser (chromium)
+        run: npx playwright install --with-deps chromium
+
+      # The video-export e2e shells out to ffprobe + volumedetect to prove
+      # the exported file really carries a non-silent audio track, and the
+      # preview test encodes a VP8/Vorbis WebM fixture — GitHub's
+      # ubuntu-latest images ship without ffmpeg (first main run: 26
+      # passed / 1 skipped / 1 ENOENT). Ubuntu's ffmpeg package provides
+      # all of it, so the suite runs whole instead of half-skipping.
+      - name: Install ffmpeg (video-export e2e dependencies)
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
+
+      # v0.15 (R4): the vector-PDF e2e proves text extractability by
+      # reading the exported file back with poppler's pdftotext — the
+      # same "verify with an independent tool" discipline ffprobe has.
+      - name: Install poppler-utils (vector-pdf e2e dependencies)
+        run: sudo apt-get install -y --no-install-recommends poppler-utils
+
+      - name: Set up database (migrations + template seed)
+        run: npm run db:setup
+
+      - name: Run Playwright e2e suite
+        run: npx playwright test
+
+      # v0.13.4 (P5): the plugin-system acceptance suite — same dev
+      # server, CANVIX_PLUGINS=1, port 3100, tests/e2e-plugins only.
+      # The default suite above keeps the flag OFF (its specs assert
+      # 503s and hidden UI); this one proves the flag-on world.
+      - name: Run Playwright plugins suite (CANVIX_PLUGINS=1)
+        run: npx playwright test -c playwright.plugins.config.ts
+
+      # v0.15 (R6): the stock-video acceptance suite — a second dev
+      # server keyed to a LOCAL MOCK Pexels API (tests/stock-video/
+      # mock-provider.mjs serves real ffmpeg-generated renditions),
+      # so the full search → insert → durable-attribution path runs
+      # without spending real provider quota. The default suite
+      # above keeps the keys unset (its spec asserts the F2b gate:
+      # hidden rail + 503 NO_PROVIDER).
+      - name: Run Playwright stock-video suite (mock provider)
+        run: npx playwright test -c playwright.stockvideo.config.ts
+
+      - name: Upload Playwright traces (on failure)
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: playwright-failures
+          path: test-results/
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # ── Docker self-host smoke: every PR + main ─────────────────────
+  # WP1 (deployment & API trust). Proves the operator story end to
+  # end on every PR: `docker compose up` from a clean checkout must
+  # produce a migrated, seeded, serving Canvix — the exact promise
+  # docs/DOCKER.md makes. Builds the production image (multi-stage,
+  # standalone) and drives the real containers:
+  #
+  #   pg17 + app → migrate-on-boot → /api/health ok:true (which
+  #   asserts reachable + migrated + seeded, incl. the boot-time
+  #   template sync) → register an account through the real route
+  #   (scrypt + session + cookies, the full auth rail) → landing
+  #   page serves → compose down.
+  #
+  # Kept separate from lint-unit/e2e: no Node setup, no npm ci —
+  # everything inside the image. Runs on ubuntu-latest's own Docker.
+  docker:
+    name: docker
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      # POSTGRES_PASSWORD is the only required variable. Compose's
+      # ${VAR:?msg} interpolation fires on EVERY compose command —
+      # `build` included — so the .env must exist before any of them
+      # (the first CI run failed exactly here: build before .env).
+      - name: Write the compose .env
+        run: echo "POSTGRES_PASSWORD=ci-smoke-password" > .env
+
+      - name: Build the app image (multi-stage, standalone)
+        run: docker compose build app
+
+      - name: Bring the stack up (pg17 + app, migrate-on-boot)
+        run: |
+          docker compose up -d --wait
+          # --wait: blocks until both containers are healthy, i.e.
+          # the entrypoint already ran migrate deploy + the server
+          # answered /api/health inside the container healthcheck.
+
+      - name: Assert /api/health is fully green (migrated + seeded)
+        run: |
+          for i in $(seq 1 30); do
+            BODY=$(curl -fsS http://localhost:3000/api/health 2>/dev/null) && break
+            sleep 2
+          done
+          echo "health: $BODY"
+          # heredoc-fed python: no shell interpolation headaches. The
+          # compose db hostname "db" classifies as remote (only
+          # localhost is local) — expected inside the compose network.
+          BODY="$BODY" python3 - <<'PY'
+          import json, os
+          body = json.loads(os.environ["BODY"])
+          assert body.get("ok") is True, f"health not ok: {body}"
+          db = body.get("database", {})
+          assert db.get("kind") == "remote" and db.get("host") == "db", f"unexpected db: {db}"
+          templates = body.get("templates", 0)
+          assert templates >= 300, f"template library did not sync on boot: {templates}"
+          print(f"health green: {templates} templates, db host {db.get('host')}")
+          PY
+
+      - name: Register an account through the real route
+        run: |
+          RESP=$(curl -sS -o /tmp/reg.json -c /tmp/reg-cookies.txt -w '%{http_code}' \
+            -H 'Content-Type: application/json' \
+            -d '{"username":"docker-smoke","password":"ci-smoke-passphrase-1"}' \
+            http://localhost:3000/api/auth/register)
+          echo "register: $RESP $(cat /tmp/reg.json)"
+          [ "$RESP" = "201" ] || { echo "register failed"; exit 1; }
+          # and the session cookie it issued actually authenticates
+          AUTH=$(curl -sS -o /tmp/me.json -b /tmp/reg-cookies.txt -w '%{http_code}' \
+            http://localhost:3000/api/auth/me)
+          echo "me (with session): $AUTH $(cat /tmp/me.json)"
+          [ "$AUTH" = "200" ] || { echo "session did not authenticate"; exit 1; }
+
+      - name: Landing page serves
+        run: |
+          CODE=$(curl -sS -o /dev/null -w '%{http_code}' http://localhost:3000/)
+          echo "landing: $CODE"
+          [ "$CODE" = "200" ]
+
+      - name: Funding-manifest verification file serves (v0.29.5)
+        run: |
+          # fundingjson.org cross-domain ownership verification: the
+          # standalone PRODUCTION server must serve public/.well-known/
+          # statically (dev-mode serving is covered by the e2e smoke).
+          # v0.32.7: the file lists every fetchable form of the manifest
+          # URL — the checkers do exact-string membership, so diff the
+          # served bytes against the committed file (all six forms).
+          curl -fsS http://localhost:3000/.well-known/funding-manifest-urls -o /tmp/wk
+          cat /tmp/wk
+          diff /tmp/wk public/.well-known/funding-manifest-urls \
+            || { echo "well-known file wrong or missing"; exit 1; }
+
+      - name: Funding-manifest domain copy serves (v0.32.7)
+        run: |
+          # canvix.app/funding.json — the domain-hosted manifest copy
+          # (byte-identical to the repository manifest, asserted by the
+          # unit test). The production container must serve it too.
+          curl -fsS http://localhost:3000/funding.json -o /tmp/fj
+          diff /tmp/fj funding.json || { echo "funding.json copy wrong or missing"; exit 1; }
+
+      - name: Assert the stack is clean after down
+        if: always()
+        run: |
+          # .env must exist for ANY compose command (the required-
+          # variable interpolation above) — re-create it in case an
+          # earlier step failed before the Write step ran
+          [ -f .env ] || echo "POSTGRES_PASSWORD=ci-smoke-password" > .env
+          docker compose down -v --remove-orphans
