@@ -57,7 +57,7 @@
   },
   "devDependencies": {
     "@netlify/plugin-nextjs": "^5.16.6",
-    "@opennextjs/cloudflare": "^1.20.17",
+    "@opennextjs/cloudflare": "^1.20.18",
     "@playwright/test": "^1.65.0",
     "@tailwindcss/postcss": "^4",
     "@types/react": "^19",
